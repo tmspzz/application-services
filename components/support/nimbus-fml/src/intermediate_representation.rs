@@ -4,7 +4,7 @@
 use crate::error::{FMLError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, path};
 
 /// The `TypeRef` enum defines a reference to a type.
 ///
@@ -43,6 +43,7 @@ pub enum TypeRef {
 }
 
 pub(crate) type StringId = String;
+pub(crate) type FMLPath = (Vec<String>, TypeRef);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FeatureManifest {
@@ -178,13 +179,161 @@ impl FeatureManifest {
         Ok(())
     }
 
+
+    // Validates that each property has a defined default
+    // for now, this doesn't look at the definitions themselves
+    // and only looks at the feature_definitions
+    // Step 1: Iterate over all features
+    //  Step 2: for each feature, we first collect all the "paths" to each
+    //          primitive value, if it's a top level property, the path is an
+    //          empty vector, otherwise, it's an ordered vector with the names
+    //          of each property on the path to the primitive value
+    //  Step 3: We validate against the default defined for the current property
+    //          if the all the paths we collected on Step 2, have a default
+    //          we end here, otherwise
+    //  Step 4: We seperate the paths remaining that have the same first element
+    //          and recurse into the property of that name. The recursive
+    //          function should return the path to the property that doesn't have
+    //          a default, so the high level error handling, can report it to the
+    //          user
     fn validate_defaults(&self) -> Result<()> {
         // TODO: Validate that the defaults of each feature
         // in the feature manifest agree with the props
         // There must be a default for each property
         // either that's defined in the property itself
         // or in the feature definition
+        // Step 1: Iterate over all the features
+        for feature_def in &self.feature_defs {
+            // Step 2: Gather a list of all the paths to primitives
+            let paths_to_primitives = self.get_paths_to_primitives(feature_def)?;
+            let missing_paths = self.validate_paths_against_defaults(feature_def, &paths_to_primitives)?;
+            if !missing_paths.is_empty() {
+                return Err(FMLError::ValidationError(format!(
+                    "Missing default for paths: {:?}",
+                    missing_paths
+                )));
+            }
+        }
         Ok(())
+    }
+
+    fn get_paths_to_primitives(&self, feature_def: &FeatureDef) -> Result<Vec<FMLPath>> {
+        let mut paths = Vec::new();
+        let mut curr_path = Vec::new();
+        for prop in &feature_def.props {
+            self.get_paths_to_primitives_prop(prop, &mut curr_path, &mut paths)?;
+        }
+
+        Ok(paths)
+    }
+
+    fn get_paths_to_primitives_prop(
+        &self,
+        prop: &PropDef,
+        curr_path: &mut Vec<String>,
+        paths: &mut Vec<FMLPath>,
+    ) -> Result<()> {
+        curr_path.push(prop.name.clone());
+        // We check if the property is a primitive
+        self.get_paths_to_primitives_typ(&prop.typ, curr_path, paths)?;
+        curr_path.pop();
+        Ok(())
+    }
+
+    fn get_paths_to_primitives_typ(
+        &self,
+        typ: &TypeRef,
+        curr_path: &mut Vec<String>,
+        paths: &mut Vec<(Vec<String>,TypeRef)>,
+    ) -> Result<()> {
+        match typ {
+            TypeRef::Object(name) => {
+                if let Some(obj_def) = self.obj_defs.iter().find(|o| o.name == *name) {
+                    for other_prop in &obj_def.props {
+                        self.get_paths_to_primitives_prop(other_prop, curr_path, paths)?;
+                    }
+                } else {
+                    return Err(FMLError::ValidationError(format!(
+                        "Object referenced but not defined: {}",
+                        name
+                    )));
+                }
+            }
+            TypeRef::EnumMap(key, value) => {
+                if let TypeRef::Enum(enum_def_name) = key.as_ref() {
+                    if let Some(enum_def) = self.enum_defs.iter().find(|o| o.name == *enum_def_name) {
+                        for variant in &enum_def.variants {
+                            curr_path.push(variant.name.clone());
+                            self.get_paths_to_primitives_typ(value, curr_path, paths)?;
+                            curr_path.pop();
+                        }
+                    } else {
+                        return Err(FMLError::ValidationError(format!(
+                            "Enum referenced but not defined: {}",
+                            enum_def_name
+                        )));
+                    }
+                } else {
+                    return Err(FMLError::ValidationError(format!(
+                        "EnumMap key is not an enum: {:?}",
+                        key
+                    )));
+                }
+            },
+            // Since the keys can be arbitrary strings,
+            // we cannot validate that the defaults of
+            // StringMaps match the property definition,
+            // instead, we terminate here, and when we later
+            // match against the defaults, as long as there
+            // exists a string map, we count it as OK
+            _ => {
+                paths.push((curr_path.clone(), typ.clone()))
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_paths_against_defaults(
+        &self,
+        feature_def: &FeatureDef,
+        paths_to_primitives: &Vec<FMLPath>,
+    ) -> Result<Vec<FMLPath>> {
+        let mut missing_paths = paths_to_primitives.clone();
+
+        if let Some(default) = &feature_def.default {
+            missing_paths = self.validate_paths_against_default(&missing_paths, default)?;
+            if missing_paths.is_empty() {
+                return Ok(missing_paths)
+            }
+        }
+        let mut ret = Vec::new();
+        for prop in &feature_def.props {
+            // We filter a collection that starts with this prop's name
+            let missing_paths_for_prop = missing_paths.iter().filter(|path| !path.0.is_empty() && path.0[0] == prop.name)
+            .map(|path| {
+                // Unwrap is safe, we check that the vector is not empty on the filter
+                let path_without_first = path.0.split_first().unwrap().1.to_vec();
+                (path_without_first, path.1.clone())
+            }).collect::<Vec<FMLPath>>();
+            ret.append(&mut self.validate_paths_against_prop_defaults(prop, &missing_paths_for_prop)?);
+        }
+        Ok(ret)
+    }
+
+    fn validate_paths_against_prop_defaults(&self, prop: &PropDef, paths_to_primitives: &Vec<FMLPath>) -> Result<Vec<FMLPath>> {
+        let missing_paths = self.validate_paths_against_default(&paths_to_primitives, &prop.default)?;
+        if missing_paths.is_empty() {
+            return Ok(missing_paths);
+        }
+
+        
+
+
+        Ok(missing_paths)
+    }
+
+    fn validate_paths_against_default(&self, paths_to_primitives: &Vec<FMLPath>, default: &Value) -> Result<Vec<FMLPath>> {
+        unimplemented!()
     }
 }
 
@@ -265,6 +414,8 @@ type Literal = Value;
 
 #[cfg(test)]
 mod unit_tests {
+    use std::vec;
+
     use serde_json::json;
 
     use super::*;
@@ -553,4 +704,68 @@ mod unit_tests {
         Ok(())
     }
     // TODO: Add more tests for defaults
+
+    #[test]
+    fn test_get_paths_to_primitives() -> Result<()> {
+        let mut fm = get_simple_homescreen_feature();
+        // we add more paths to stress test it
+        fm.feature_defs[0].props.push(
+            PropDef {
+                name: "other-prop".into(),
+                typ: TypeRef::Object("TestObject".into()),
+                default: json!(null),
+                doc: "test doc".into(),
+            }
+        );
+
+        fm.obj_defs.push(
+            ObjectDef {
+                name: "TestObject".into(),
+                props: vec![
+                    PropDef {
+                        name: "an-int".into(),
+                        typ: TypeRef::Int,
+                        doc: "".into(),
+                        default: json!(null),
+                    },
+                    PropDef {
+                        name: "a-list".into(),
+                        typ: TypeRef::List(Box::new(TypeRef::Int)),
+                        doc: "".into(),
+                        default: json!(null),
+                    },
+                    PropDef {
+                        name: "an-enum".into(),
+                        typ: TypeRef::Enum("TestEnum".into()),
+                        doc: "".into(),
+                        default: json!(null),
+                    },
+                    PropDef {
+                        name: "nested-enum-map".into(),
+                        typ: TypeRef::EnumMap(
+                            Box::new(TypeRef::Enum("SectionId".into())),
+                            Box::new(TypeRef::Boolean),
+                        ),
+                        default: json!(null),
+                        doc: "Test-enum-map".into()
+                    }
+                ],
+                doc: "Test doc".into(),
+            }
+        );
+
+        let paths = fm.get_paths_to_primitives(&fm.feature_defs[0])?;
+        assert_eq!(paths, vec![
+            (vec!["sections-enabled".into(), "top-sites".into()], TypeRef::Boolean),
+            (vec!["sections-enabled".into(), "jump-back-in".into()], TypeRef::Boolean),
+            (vec!["sections-enabled".into(), "recently-saved".into()], TypeRef::Boolean),
+            (vec!["other-prop".into(), "an-int".into()], TypeRef::Int),
+            (vec!["other-prop".into(), "a-list".into()], TypeRef::List(Box::new(TypeRef::Int))),
+            (vec!["other-prop".into(), "an-enum".into()], TypeRef::Enum("TestEnum".into())),
+            (vec!["other-prop".into(), "nested-enum-map".into(), "top-sites".into()], TypeRef::Boolean),
+            (vec!["other-prop".into(), "nested-enum-map".into(), "jump-back-in".into()], TypeRef::Boolean),
+            (vec!["other-prop".into(), "nested-enum-map".into(), "recently-saved".into()], TypeRef::Boolean),
+        ]);
+        Ok(())
+    }
 }
