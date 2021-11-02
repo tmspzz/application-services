@@ -11,6 +11,7 @@ use nimbus::{
 };
 use std::collections::HashMap;
 use std::io::prelude::*;
+use std::process::exit;
 
 const DEFAULT_BASE_URL: &str = "https://firefox.settings.services.mozilla.com";
 const DEFAULT_COLLECTION_NAME: &str = "messaging-experiments";
@@ -143,6 +144,17 @@ fn main() -> Result<()> {
                 .short("n")
                 .default_value("10000")
                 .help("The number of times to generate a UUID and attempt enrollment.")
+            )
+        )
+        .subcommand(
+            SubCommand::with_name("validate-targeting")
+            .about("Validates a targeting string against the Nimbus SDK, exits with status 1 if it is not")
+            .arg(
+                Arg::with_name("targeting")
+                .long("targeting")
+                .short("t")
+                .required(true)
+                .takes_value(true)
             )
         )
         .get_matches();
@@ -358,6 +370,21 @@ fn main() -> Result<()> {
                 results.insert(key, results.get(&key).unwrap_or(&0) + 1);
             }
             println!("Results: {:#?}", results);
+        }
+        ("validate-targeting", Some(matches)) => {
+            println!("======================================");
+            let targeting_str = matches
+                .value_of("targeting")
+                .expect("The targeting string argument is required for this subcommand");
+            if let Err(e) = nimbus_client.is_valid_targeting(targeting_str) {
+                eprintln!(
+                    "Invalid targeting string {}, got error: {}",
+                    targeting_str,
+                    e.to_string()
+                );
+                exit(1)
+            }
+            println!("Targeting string valid!")
         }
         (&_, _) => println!("Invalid subcommand"),
     };

@@ -69,7 +69,6 @@ impl From<AppContext> for TargetingAttributes {
 #[derive(Default)]
 struct InternalMutableState {
     available_randomization_units: AvailableRandomizationUnits,
-    // Application level targeting attributes
     targeting_attributes: TargetingAttributes,
 }
 
@@ -456,6 +455,26 @@ impl NimbusClient {
 
     fn db(&self) -> Result<&Database> {
         self.db.get_or_try_init(|| Database::new(&self.db_path))
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn is_valid_targeting(&self, targeting_str: &str) -> Result<()> {
+        use jexl_eval::Evaluator;
+        let targeting_attributes = self
+            .mutable_state
+            .lock()
+            .unwrap()
+            .targeting_attributes
+            .clone();
+        match Evaluator::new()
+            .eval_in_context(targeting_str, &targeting_attributes)?
+            .as_bool()
+        {
+            Some(_) => Ok(()),
+            None => Err(NimbusError::EvaluationError(
+                "Does not evalute to a boolean".into(),
+            )),
+        }
     }
 }
 
