@@ -2,7 +2,7 @@
 * License, v. 2.0. If a copy of the MPL was not distributed with this
 * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use crate::{backends, GenerateExperimenterManifestCmd, TargetLanguage};
+use crate::{backends, GenerateExperimenterManifestCmd, GenerateIRCmd, TargetLanguage};
 
 use crate::error::Result;
 use crate::intermediate_representation::FeatureManifest;
@@ -32,6 +32,12 @@ pub(crate) fn generate_experimenter_manifest(
 ) -> Result<()> {
     let ir = load_feature_manifest(&cmd.manifest, cmd.load_from_ir)?;
     backends::experimenter_manifest::generate_manifest(ir, config, cmd)?;
+    Ok(())
+}
+
+pub(crate) fn generate_ir(_: Config, cmd: GenerateIRCmd) -> Result<()> {
+    let ir = load_feature_manifest(&cmd.manifest, cmd.load_from_ir)?;
+    std::fs::write(cmd.output, serde_json::to_string_pretty(&ir)?)?;
     Ok(())
 }
 

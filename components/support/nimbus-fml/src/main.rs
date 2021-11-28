@@ -65,6 +65,14 @@ fn main() -> Result<()> {
                 load_from_ir: matches.is_present("ir"),
             },
         )?,
+        ("intermediate-repr", _) => workflows::generate_ir(
+            config,
+            GenerateIRCmd {
+                manifest: file_path("INPUT", &matches, &cwd)?,
+                output: file_path("output", &matches, &cwd)?,
+                load_from_ir: matches.is_present("ir"),
+            },
+        )?,
         (word, _) => unimplemented!("Command {} not implemented", word),
     };
 
@@ -97,6 +105,12 @@ pub struct GenerateStructCmd {
 }
 
 pub struct GenerateExperimenterManifestCmd {
+    manifest: PathBuf,
+    output: PathBuf,
+    load_from_ir: bool,
+}
+
+pub struct GenerateIRCmd {
     manifest: PathBuf,
     output: PathBuf,
     load_from_ir: bool,

@@ -49,3 +49,5 @@ subcommands:
                 global: true
     - experimenter:
         about: Generate code for Experimenter
+    - intermediate-repr:
+        about: Generate the intermediate representation json

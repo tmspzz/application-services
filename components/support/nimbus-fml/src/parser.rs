@@ -69,6 +69,69 @@ pub(crate) struct ManifestFrontEnd {
     channels: Vec<String>,
 }
 
+trait MergableDefault: Sized {
+    fn merge(self, new: Self) -> Self;
+}
+
+impl MergableDefault for serde_json::Map<String, serde_json::Value> {
+    fn merge(self, new: Self) -> Self {
+        let mut merged = serde_json::Map::new();
+        for (key, val) in self {
+            merged.insert(key, val);
+        }
+        for (key, val) in new {
+            if merged.contains_key(&key) {
+                let old_val = merged.get(&key).unwrap().clone();
+                merged.insert(key, old_val.merge(val));
+            } else {
+                merged.insert(key, val);
+            }
+        }
+        merged
+    }
+}
+
+impl MergableDefault for serde_json::Value {
+    fn merge(self, new: Self) -> Self {
+        use serde_json::Value::{Array, Number, Object, String};
+        match (self, new) {
+            (Number(old), Number(new)) => Number(old.merge(new)),
+            (String(old), String(new)) => String(old.merge(new)),
+            (Array(old), Array(new)) => Array(old.merge(new)),
+            (Object(old), Object(new)) => Object(old.merge(new)),
+            (_, new) => new,
+        }
+    }
+}
+
+impl MergableDefault for serde_json::Number {
+    fn merge(self, new: Self) -> Self {
+        new
+    }
+}
+
+impl MergableDefault for Vec<serde_json::Value> {
+    fn merge(self, new: Self) -> Self {
+        new
+    }
+}
+
+impl<V: MergableDefault> MergableDefault for Option<V> {
+    fn merge(self, new: Self) -> Self {
+        match (self, new) {
+            (None, new) => new,
+            (old, None) => old,
+            (Some(old), Some(new)) => Some(old.merge(new)),
+        }
+    }
+}
+
+impl MergableDefault for String {
+    fn merge(self, new: Self) -> Self {
+        new
+    }
+}
+
 fn parse_typeref_string(input: String) -> Result<(String, Option<String>), FMLError> {
     // Split the string into the TypeRef and the name
     let mut object_type_iter = input.split(&['<', '>'][..]);
@@ -222,50 +285,52 @@ impl Parser {
             types.insert(o.name.to_owned(), TypeRef::Object(o.name.to_owned()));
         });
 
-        let features: Vec<FeatureDef> = manifest
+        let features: Result<Vec<FeatureDef>, FMLError> = manifest
             .features
             .into_iter()
-            .map(|f| FeatureDef {
-                name: f.0,
-                doc: f.1.description,
-                props: f
-                    .1
-                    .variables
-                    .into_iter()
-                    .map(|v| PropDef {
-                        name: v.0,
-                        doc: v.1.description,
-                        typ: match get_typeref_from_string(
-                            v.1.variable_type.to_owned(),
-                            Some(types.clone()),
-                        ) {
-                            Ok(type_ref) => type_ref,
-                            Err(e) => {
-                                // Try matching against the user defined types
-                                match types.get(&v.1.variable_type) {
-                                    Some(type_ref) => type_ref.to_owned(),
-                                    None => panic!(
-                                        "{}\n{} is not a valid FML type or user defined type",
-                                        e, v.1.variable_type
-                                    ),
+            .map(|f| {
+                Ok(FeatureDef {
+                    name: f.0,
+                    doc: f.1.description,
+                    props: f
+                        .1
+                        .variables
+                        .into_iter()
+                        .map(|v| PropDef {
+                            name: v.0,
+                            doc: v.1.description,
+                            typ: match get_typeref_from_string(
+                                v.1.variable_type.to_owned(),
+                                Some(types.clone()),
+                            ) {
+                                Ok(type_ref) => type_ref,
+                                Err(e) => {
+                                    // Try matching against the user defined types
+                                    match types.get(&v.1.variable_type) {
+                                        Some(type_ref) => type_ref.to_owned(),
+                                        None => panic!(
+                                            "{}\n{} is not a valid FML type or user defined type",
+                                            e, v.1.variable_type
+                                        ),
+                                    }
                                 }
-                            }
-                        },
-                        default: json!(v.1.default),
-                    })
-                    .collect(),
-                default: if f.1.default.is_some() {
-                    Some(json!(f.1.default))
-                } else {
-                    None
-                },
+                            },
+                            default: json!(v.1.default),
+                        })
+                        .collect(),
+                    default: if let Some(defaults) = f.1.default {
+                        Some(Self::merge_defaults(defaults)?)
+                    } else {
+                        None
+                    },
+                })
             })
             .collect();
 
         Ok(Parser {
             enums,
             objects,
-            features,
+            features: features?,
             channels: manifest.channels,
         })
     }
@@ -278,6 +343,34 @@ impl Parser {
             feature_defs: self.features.clone(),
         })
     }
+
+    fn merge_defaults(defaults: serde_json::Value) -> Result<serde_json::Value, FMLError> {
+        let mut channel_map = HashMap::new();
+        let defaults = serde_json::from_value::<Vec<Defaults>>(defaults)?;
+        for default in defaults {
+            if channel_map.contains_key(&default.channel) {
+                let old_default = channel_map.get(&default.channel).unwrap();
+                let merged = Self::merge_two_defaults(old_default, &default.value);
+                channel_map.insert(default.channel, merged);
+            } else {
+                channel_map.insert(default.channel, default.value);
+            }
+        }
+        Ok(serde_json::to_value(channel_map)?)
+    }
+
+    fn merge_two_defaults(
+        old_default: &serde_json::Value,
+        new_default: &serde_json::Value,
+    ) -> serde_json::Value {
+        old_default.clone().merge(new_default.clone())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Defaults {
+    channel: String,
+    value: serde_json::Value,
 }
 
 #[cfg(test)]
